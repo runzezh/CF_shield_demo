@@ -63,3 +63,7 @@ Strict Typing: Our AI Gateway handler correctly manages 401/404s, stream handlin
 Fail-Open Design: If R2 or AI Gateway misconfigures, the Shield falls back to the Origin or Standard Web handling to ensure 100% uptime.
 Conclusion
 CloudEdging isn't just a tool; it's an Architecture-as-a-Service. By partnering with Cloudflare, we bring complex, multi-product architectures (Worker + KV + R2 + AI Gateway) to mass-market customers who would otherwise stay on legacy cloud providers.
+
+
+-----
+Added semantic caching on 24th, Feb, 2026, to encourage usage of workers ai and vectorize for ai inference apps while keeping their token usage efficient
