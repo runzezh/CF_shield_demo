@@ -13,7 +13,7 @@ async function handleR2Storage(request, env, config, ctx, url) {
     const path = url.pathname;
 
     // 1. Validate file extension (Security Guard)
-    const staticExtensions = /\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|woff2?|ttf|eot|otf|mp4|webm|mp3|pdf|txt|json|zip|bin)$/i;
+    const staticExtensions = /\.(jpg|jpeg|png|gif|webp|avif|heic|heif|svg|ico|css|js|woff2?|ttf|eot|otf|mp4|webm|mov|m4v|avi|mkv|mp3|flac|wav|ogg|m4a|pdf|txt|json|zip|bin)$/i;
     if (!staticExtensions.test(path)) {
         return handleWebTraffic(request, env, config, ctx, url);
     }
@@ -76,9 +76,14 @@ async function handleR2Storage(request, env, config, ctx, url) {
         ctx.waitUntil(
             (async () => {
                 try {
-                    const contentLength = parseInt(toStore.headers.get("Content-Length") || "0");
                     const contentType = toStore.headers.get("Content-Type") || "";
                     const cacheControl = toStore.headers.get("Cache-Control") || "";
+
+                    // Content-Length may be absent (chunked transfer, gzip, etc.)
+                    // Read the body as arrayBuffer so we can check real size without
+                    // relying on the header being present.
+                    const bodyBuffer = await toStore.arrayBuffer();
+                    const bodySize = bodyBuffer.byteLength;
 
                     const mirrorableTypes = [
                         "image/", "video/", "audio/", "javascript", "css",
@@ -88,8 +93,8 @@ async function handleR2Storage(request, env, config, ctx, url) {
                     const isMirrorableType = mirrorableTypes.some((type) => contentType.includes(type));
 
                     const shouldMirror =
-                        contentLength > 0 &&
-                        contentLength < 100 * 1024 * 1024 && // <100MB
+                        bodySize > 0 &&
+                        bodySize < 100 * 1024 * 1024 && // <100MB
                         isMirrorableType &&
                         !cacheControl.includes("no-store") &&
                         !cacheControl.includes("private");
@@ -101,8 +106,8 @@ async function handleR2Storage(request, env, config, ctx, url) {
                             httpMetadata.contentEncoding = toStore.headers.get("Content-Encoding");
                         }
 
-                        await env.STORAGE_BUCKET.put(r2Key, toStore.body, { httpMetadata });
-                        console.log(`[R2 Shield] Mirrored: ${path} (${(contentLength / 1024).toFixed(1)}KB)`);
+                        await env.STORAGE_BUCKET.put(r2Key, bodyBuffer, { httpMetadata });
+                        console.log(`[R2 Shield] Mirrored: ${path} (${(bodySize / 1024).toFixed(1)}KB)`);
                     }
                 } catch (err) {
                     console.error(`[R2 Shield] Mirror failed: ${path}`, err.message);
@@ -118,11 +123,15 @@ function getContentType(filename) {
     const ext = filename.split(".").pop().toLowerCase();
     const types = {
         jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
-        webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon",
+        webp: "image/webp", avif: "image/avif", heic: "image/heic", heif: "image/heif",
+        svg: "image/svg+xml", ico: "image/x-icon",
         css: "text/css", js: "application/javascript", json: "application/json",
         woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf",
         eot: "application/vnd.ms-fontobject", otf: "font/otf",
-        mp4: "video/mp4", webm: "video/webm", mp3: "audio/mpeg",
+        mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
+        m4v: "video/x-m4v", avi: "video/x-msvideo", mkv: "video/x-matroska",
+        mp3: "audio/mpeg", flac: "audio/flac", wav: "audio/wav",
+        ogg: "audio/ogg", m4a: "audio/mp4",
         pdf: "application/pdf", txt: "text/plain",
         zip: "application/zip", bin: "application/octet-stream",
     };
