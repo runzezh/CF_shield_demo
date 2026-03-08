@@ -27,12 +27,18 @@ async function runSecurityPipeline(request, env, config, url, ctx) {
     }
 
     // C. RATE LIMITING (KV-backed counter, 60s window)
+    // Default threshold scales with CF plan — Pro/Business/Enterprise customers
+    // have higher legitimate traffic volumes so we raise the default ceiling.
+    // Customer can still override via config.rate_limit_threshold explicitly.
     if (env.CLOUDEDGING_CACHE && config.rate_limit_enabled) {
         const limitKey = `RL_${env.CLIENT_ID}_${ip}`;
+        const planDefaults = { free: 100, pro: 200, business: 500, enterprise: 1000 };
+        const plan = (config.cloudflare_plan || "free").toLowerCase();
+        const planDefault = planDefaults[plan] || 100;
+        const threshold = config.rate_limit_threshold || planDefault;
         try {
             const currentValue = await env.CLOUDEDGING_CACHE.get(limitKey);
             const currentCount = parseInt(currentValue || "0");
-            const threshold = config.rate_limit_threshold || 100;
             if (currentCount >= threshold) {
                 return new Response(
                     JSON.stringify({ error: "Rate limit exceeded", retry_after: 60 }),
