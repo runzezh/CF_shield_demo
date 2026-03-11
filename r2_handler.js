@@ -76,14 +76,9 @@ async function handleR2Storage(request, env, config, ctx, url) {
         ctx.waitUntil(
             (async () => {
                 try {
+                    const contentLength = parseInt(toStore.headers.get("Content-Length") || "0");
                     const contentType = toStore.headers.get("Content-Type") || "";
                     const cacheControl = toStore.headers.get("Cache-Control") || "";
-
-                    // Content-Length may be absent (chunked transfer, gzip, etc.)
-                    // Read the body as arrayBuffer so we can check real size without
-                    // relying on the header being present.
-                    const bodyBuffer = await toStore.arrayBuffer();
-                    const bodySize = bodyBuffer.byteLength;
 
                     const mirrorableTypes = [
                         "image/", "video/", "audio/", "javascript", "css",
@@ -92,9 +87,11 @@ async function handleR2Storage(request, env, config, ctx, url) {
 
                     const isMirrorableType = mirrorableTypes.some((type) => contentType.includes(type));
 
+                    // Skip mirror if Content-Length is missing (chunked transfer) — never buffer
+                    // unknown-size bodies into Worker RAM (128MB hard limit, OOM kills the isolate).
                     const shouldMirror =
-                        bodySize > 0 &&
-                        bodySize < 100 * 1024 * 1024 && // <100MB
+                        contentLength > 0 &&
+                        contentLength < 100 * 1024 * 1024 && // <100MB
                         isMirrorableType &&
                         !cacheControl.includes("no-store") &&
                         !cacheControl.includes("private");
@@ -106,8 +103,9 @@ async function handleR2Storage(request, env, config, ctx, url) {
                             httpMetadata.contentEncoding = toStore.headers.get("Content-Encoding");
                         }
 
-                        await env.STORAGE_BUCKET.put(r2Key, bodyBuffer, { httpMetadata });
-                        console.log(`[R2 Shield] Mirrored: ${path} (${(bodySize / 1024).toFixed(1)}KB)`);
+                        // Stream body directly to R2 — no arrayBuffer(), no RAM buffering
+                        await env.STORAGE_BUCKET.put(r2Key, toStore.body, { httpMetadata });
+                        console.log(`[R2 Shield] Mirrored: ${path} (${(contentLength / 1024).toFixed(1)}KB)`);
                     }
                 } catch (err) {
                     console.error(`[R2 Shield] Mirror failed: ${path}`, err.message);
