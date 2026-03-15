@@ -61,8 +61,18 @@ async function handleWebTraffic(request, env, config, ctx, url) {
     const cookies = request.headers.get("Cookie") || "";
     const authHeader = request.headers.get("Authorization") || "";
     const isAuthenticated =
-        /session|cart|logged_in|auth_token|user_id|SESS/i.test(cookies) ||
-        /Bearer|Basic|Token|OAuth/i.test(authHeader);
+        // Explicit auth headers
+        /Bearer|Basic|Token|OAuth/i.test(authHeader) ||
+        // Common session cookie names — broad pattern covers:
+        // Generic: session, auth_token, logged_in, user_id, cart, SESS
+        // Rails:   _app_session, _myapp_session (any _*_session pattern)
+        // Django:  sessionid
+        // Laravel: laravel_session
+        // Express: connect.sid
+        // Flask:   session (covered by generic)
+        // PHP:     PHPSESSID
+        /session|cart|logged_in|auth_token|user_id|SESS|sessionid|connect\.sid|PHPSESSID/i.test(cookies) ||
+        /_[a-z0-9_]+-?session=/i.test(cookies);  // Rails _app_session, _myapp_session patterns
 
     // 2. Cache Decision
     let shouldCache = !isWrite;
@@ -70,6 +80,14 @@ async function handleWebTraffic(request, env, config, ctx, url) {
 
     if (isAggressive) {
         shouldCache = isAuthenticated ? false : true;
+    } else if (config.mode === "SAAS") {
+        // SAAS: default safe — only cache known-static content types.
+        // User dashboards, reports, and data endpoints are user-specific.
+        // Caching them risks serving User A's data to User B.
+        // We check the RESPONSE content-type after origin fetch (step 6 below).
+        // For now, allow caching only for non-authenticated GET requests,
+        // and enforce content-type guard before storing.
+        shouldCache = !isAuthenticated;
     } else {
         const bypassHeaders =
             (request.headers.get("Cache-Control") || "").includes("no-cache") ||
@@ -121,6 +139,24 @@ async function handleWebTraffic(request, env, config, ctx, url) {
     // 6. Origin Guard & Store
     const originForbids = (response.headers.get("Cache-Control") || "").includes("no-store");
     if (shouldCache && originForbids && !physics.aggressive_cache) shouldCache = false;
+
+    // SAAS content-type guard — only cache known-safe static types.
+    // Never cache HTML or JSON in SAAS mode regardless of auth detection,
+    // because user-specific pages may not set session cookies on every request
+    // (e.g. API-authenticated SPAs that send Bearer tokens on data calls but
+    // serve the HTML shell unauthenticated).
+    if (config.mode === "SAAS" && shouldCache) {
+        const ct = response.headers.get("Content-Type") || "";
+        const isCacheableSaasType =
+            ct.includes("text/css") ||
+            ct.includes("application/javascript") ||
+            ct.includes("image/") ||
+            ct.includes("font/") ||
+            ct.includes("application/font") ||
+            ct.includes("video/") ||
+            ct.includes("audio/");
+        if (!isCacheableSaasType) shouldCache = false;
+    }
 
     const status = shouldCache ? "MISS" : "BYPASS";
     const finalResponse = addShieldHeader(response, status);
