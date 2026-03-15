@@ -7,18 +7,109 @@ async function runSecurityPipeline(request, env, config, url, ctx) {
     const ip = request.headers.get("CF-Connecting-IP");
     const country = request.cf?.country || "XX";
 
-    // A. CORS Preflight (covers AI endpoints too)
-    const isApiPath = /\/(api|v1|v2|v3|graphql|rest|models|chat|embeddings|messages)/.test(url.pathname);
-    if (request.method === "OPTIONS" && (config.mode === "API" || config.mode === "AI_INFERENCE" || isApiPath)) {
-        return new Response(null, {
-            status: 204,
+    // ── HEALTH CHECK ENDPOINT ─────────────────────────────────────────────────
+    // Protected by HEALTH_SECRET Worker secret (injected via wrangler secret put).
+    // Returns current Worker state for pre-production verification and monitoring.
+    // Use: curl -H "X-CloudEdging-Health: {secret}" https://domain.com/__shield/health
+    //
+    // This endpoint is the primary tool for verifying a deployment before routing
+    // real customer traffic through it. Always check this after deploy:
+    //   - origin_reachable: false → wrong ORIGIN_HOSTNAME, all requests will 502
+    //   - mode: "STANDARD" when expecting "ECOMMERCE" → brain config not pushed
+    //   - config_age_ms > 120000 → KV read is failing, Worker running on stale config
+    if (url.pathname === "/__shield/health") {
+        const providedSecret = request.headers.get("X-CloudEdging-Health");
+        if (!env.HEALTH_SECRET || providedSecret !== env.HEALTH_SECRET) {
+            // Return 404 not 403 — don't reveal the endpoint exists to scanners
+            return new Response("Not Found", { status: 404 });
+        }
+
+        // Probe origin reachability
+        let originReachable = false;
+        let originResponseMs = null;
+        try {
+            const origin = env.ORIGIN_HOSTNAME || "__ORIGIN__";
+            const probeStart = Date.now();
+            const probe = await fetch(`https://${origin}/`, {
+                method: "HEAD",
+                redirect: "manual",
+                cf: { cacheTtl: 0 },
+                signal: AbortSignal.timeout(10000), // 10s — 3s too short for cold-starting origins (Heroku, Render)
+            });
+            originResponseMs = Date.now() - probeStart;
+            // Any response (including 3xx, 4xx) means origin is reachable
+            originReachable = probe.status < 600;
+        } catch (e) {
+            originReachable = false;
+        }
+
+        const configAgeMs = LAST_CONFIG_FETCH > 0 ? Date.now() - LAST_CONFIG_FETCH : null;
+
+        return new Response(JSON.stringify({
+            status: "ok",
+            version: "3.1.0",
+            client_id: env.CLIENT_ID || "unknown",
+            mode: config.mode || "STANDARD",
+            origin: env.ORIGIN_HOSTNAME || "not_set",
+            origin_reachable: originReachable,
+            origin_response_ms: originResponseMs,
+            cache_enabled: !!(config.cache_ttl),
+            rate_limit_enabled: config.rate_limit_enabled || false,
+            geo_block_countries: (config.blocked_countries || []).length,
+            config_age_ms: configAgeMs,
+            config_loaded: !!CACHED_CONFIG,
+            kv_bound: !!env.CLOUDEDGING_CONFIG,
+            r2_bound: !!env.STORAGE_BUCKET,
+            vectorize_bound: !!env.SEMANTIC_DB,
+            ai_bound: !!env.AI,
+            timestamp: new Date().toISOString(),
+        }, null, 2), {
+            status: 200,
             headers: {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS,PATCH",
-                "Access-Control-Allow-Headers": "Content-Type,Authorization,X-API-Key,anthropic-version",
-                "Access-Control-Max-Age": "86400",
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                "X-Shield-Health": "true",
             },
         });
+    }
+
+    // A. CORS Preflight (covers AI endpoints too)
+    // Must also respect config.cors_origins — a credentialed preflight that gets
+    // Access-Control-Allow-Origin: * will cause the browser to block the actual request.
+    const isApiPath = /\/(api|v1|v2|v3|graphql|rest|models|chat|embeddings|messages)/.test(url.pathname);
+    if (request.method === "OPTIONS" && (config.mode === "API" || config.mode === "AI_INFERENCE" || isApiPath)) {
+        const preflightOrigin = request.headers.get("Origin") || "";
+        const allowedOrigins = config.cors_origins || [];
+        // Default null — only set if origin is explicitly valid.
+        // Defaulting to "*" leaks that the API is public to unauthorised origins.
+        let corsOriginHeader = null;
+        let credentialsHeader = null;
+
+        if (allowedOrigins.length > 0 && preflightOrigin) {
+            if (allowedOrigins.includes(preflightOrigin) || allowedOrigins.includes("*")) {
+                corsOriginHeader = preflightOrigin;
+                credentialsHeader = "true";
+            }
+            // else: unauthorised origin — corsOriginHeader stays null, no CORS header returned
+        } else if (allowedOrigins.length === 0) {
+            // No restrictions configured — public API, wildcard is correct
+            corsOriginHeader = "*";
+        }
+
+        const preflightHeaders = {
+            "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS,PATCH",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization,X-API-Key,anthropic-version",
+            "Access-Control-Max-Age": "86400",
+        };
+        if (corsOriginHeader) {
+            preflightHeaders["Access-Control-Allow-Origin"] = corsOriginHeader;
+        }
+        if (credentialsHeader) {
+            preflightHeaders["Access-Control-Allow-Credentials"] = credentialsHeader;
+            preflightHeaders["Vary"] = "Origin";
+        }
+
+        return new Response(null, { status: 204, headers: preflightHeaders });
     }
 
     // B. GEO-BORDER
