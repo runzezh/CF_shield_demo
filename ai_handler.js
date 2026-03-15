@@ -1,5 +1,5 @@
 // ============================================================
-// AI GATEWAY HANDLER — v3.0.0
+// AI GATEWAY HANDLER — v3.1.0
 //
 // UPGRADED: Exact-match KV cache → Vectorize semantic cache
 // Original provider routing, validation, streaming all preserved.
@@ -107,9 +107,14 @@ async function handleAIGateway(request, env, config, ctx, url) {
         const finalResponse = createAIResponse(response, provider, config, env, latency);
 
         // ── ASYNC: Store in semantic cache on MISS ─────────
+        // CRITICAL: clone finalResponse, NOT the original response.
+        // createAIResponse() passes response.body into a new Response, which transfers
+        // and locks the original stream. Calling response.clone() after that throws:
+        //   TypeError: Cannot clone a response that has already been used
+        // finalResponse is a fresh Response object with an unlocked body — safe to clone.
         if (semanticEnabled && response.ok && request.method === "POST") {
             ctx.waitUntil(
-                semanticCacheStore(request.clone(), response.clone(), env, config, missEmbedding)
+                semanticCacheStore(request.clone(), finalResponse.clone(), env, config, missEmbedding)
                     .catch((err) => console.error("[Semantic Cache] Store error:", err.message))
             );
         }
@@ -187,7 +192,7 @@ async function semanticCachePipeline(request, env, config, provider, startTime) 
                             "X-Shield-AI-Cache-Score": best.score.toFixed(4),
                             "X-Shield-AI-Cache-Model": best.metadata?.model || "unknown",
                             "X-Shield-AI-Latency": String(Date.now() - startTime),
-                            "X-Shield-Version": "3.0.0",
+                            "X-Shield-Version": "3.1.0",
                         },
                     }),
                     embedding: null, // HIT — no need to store
@@ -438,7 +443,7 @@ function createStreamingResponse(response, provider, config) {
             "X-Shield-AI-Provider": provider,
             "X-Shield-AI-Gateway": config.ai_gateway_id,
             "X-Shield-AI-Stream": "true",
-            "X-Shield-Version": "3.0.0",
+            "X-Shield-Version": "3.1.0",
         },
     });
 }
@@ -448,7 +453,7 @@ function createAIResponse(response, provider, config, env, latency) {
     newRes.headers.set("X-Shield-AI-Provider", provider);
     newRes.headers.set("X-Shield-AI-Gateway", config.ai_gateway_id);
     newRes.headers.set("X-Shield-AI-Latency", latency.toString());
-    newRes.headers.set("X-Shield-Version", "3.0.0");
+    newRes.headers.set("X-Shield-Version", "3.1.0");
     const cfCache = response.headers.get("cf-cache-status");
     if (cfCache) newRes.headers.set("X-Shield-AI-Cache", cfCache);
     return newRes;
@@ -476,8 +481,8 @@ function handleAIError(error, provider, env) {
 async function logAIAnalytics(env, data) {
     if (!env.CLOUDEDGING_ANALYTICS) return;
     try {
-        const key = `ai_analytics:${data.client_id}:${Date.now()}`;
+        // crypto.randomUUID() — not Date.now() — prevents 1ms key collision at high req rates
+        const key = `ai_analytics:${data.client_id}:${crypto.randomUUID()}`;
         await env.CLOUDEDGING_ANALYTICS.put(key, JSON.stringify(data), { expirationTtl: 2592000 });
     } catch (e) {}
 }
-
