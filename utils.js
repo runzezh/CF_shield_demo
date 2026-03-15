@@ -24,7 +24,14 @@ async function fetchFromOrigin(request, env, url, method, optimize) {
             method,
             headers,
             body: method === "GET" || method === "HEAD" ? null : request.body,
-            redirect: "follow",
+            // redirect: "manual" — proxy redirects transparently to the browser.
+            // "follow" would silently resolve 301/302 inside the Worker, breaking:
+            //   - Login redirect flows (/account → 302 /login)
+            //   - Payment callbacks (/checkout/complete → 302 /thank-you)
+            //   - SEO redirects (www → non-www)
+            //   - Any flow where the browser must handle the redirect itself
+            // A transparent proxy must never decide redirects on the client's behalf.
+            redirect: "manual",
             cf: cfOptions,
         });
     } catch (e) {
@@ -67,11 +74,11 @@ function addShieldHeader(res, status) {
     return newRes;
 }
 
-function fortifyResponse(res, config, env, url) {
+function fortifyResponse(res, config, env, url, req) {
     const newRes = new Response(res.body, res);
     const isApi = config.mode === "API" || config.mode === "AI_INFERENCE" || url.hostname.includes("api.");
 
-    newRes.headers.set("X-Shield-Version", "3.0.0");
+    newRes.headers.set("X-Shield-Version", "3.1.0");
     newRes.headers.set("X-Shield-Client-ID", env.CLIENT_ID || "unknown");
     newRes.headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
     newRes.headers.set("X-Content-Type-Options", "nosniff");
@@ -85,7 +92,27 @@ function fortifyResponse(res, config, env, url) {
     toDelete.forEach((h) => newRes.headers.delete(h));
 
     if (isApi) {
-        newRes.headers.set("Access-Control-Allow-Origin", "*");
+        // CORS for API/AI_INFERENCE modes.
+        // Origin MUST be read from the incoming request (req), not the response (res).
+        // Origin servers never send an "Origin" header — browsers send it in requests.
+        // res.headers.get("Origin") is always null, causing silent fallback to wildcard.
+        // req is passed from core.js fetch() handler as the 5th argument.
+        const requestOrigin = req?.headers.get("Origin") || "";
+        const allowedOrigins = config.cors_origins || [];
+
+        if (allowedOrigins.length > 0 && requestOrigin) {
+            // Specific origins configured — required for credentialed cross-origin calls.
+            // Browsers reject Access-Control-Allow-Credentials: true with wildcard origin.
+            if (allowedOrigins.includes(requestOrigin) || allowedOrigins.includes("*")) {
+                newRes.headers.set("Access-Control-Allow-Origin", requestOrigin);
+                newRes.headers.set("Access-Control-Allow-Credentials", "true");
+                newRes.headers.set("Vary", "Origin");
+            }
+        } else {
+            // No specific origins configured — wildcard default (public APIs only).
+            // Set config.cors_origins in brain_config to enable credentialed cross-origin calls.
+            newRes.headers.set("Access-Control-Allow-Origin", "*");
+        }
         newRes.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS,PATCH");
         newRes.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-API-Key,anthropic-version");
     }
@@ -129,8 +156,10 @@ async function handleWebSocket(request, env) {
             server.accept();
             server.addEventListener("message", (e) => originSocket.send(e.data));
             server.addEventListener("close", () => originSocket.close());
+            server.addEventListener("error", () => originSocket.close());
             originSocket.addEventListener("message", (e) => server.send(e.data));
             originSocket.addEventListener("close", () => server.close());
+            originSocket.addEventListener("error", () => server.close());
             return new Response(null, { status: 101, webSocket: client });
         }
         return originResponse;
