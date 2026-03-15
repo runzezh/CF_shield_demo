@@ -1,5 +1,5 @@
 /**
- * CLOUDEDGING SHIELD v3.0.0 — Core Entry Point
+ * CLOUDEDGING SHIELD v3.1.0 — Core Entry Point
  * Architecture: Middleware Pipeline with Feature Registry
  *
  * Each mode maps to a handler. Config is loaded from KV (CLOUDEDGING_CONFIG).
@@ -32,23 +32,28 @@ export default {
         const url = new URL(request.url);
 
         try {
-            // 0. PROTOCOL HANDLERS
-            const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase().trim();
-            if (upgradeHeader === "websocket") return await handleWebSocket(request, env);
-
-            // 1. LOAD CONFIGURATION
+            // 0. LOAD CONFIGURATION (needed by security pipeline for all paths)
             const config = await loadConfig(env);
 
-            // 2. SECURITY PIPELINE (Universal)
+            // 1. SECURITY PIPELINE (Universal — runs before protocol handlers)
+            // Must run before WebSocket upgrade check so geo-block and rate limiting
+            // apply to WebSocket connections. A sanctioned country bypassing HTTP blocks
+            // via WebSocket is a compliance violation for REALTIME/crypto customers.
             const securityResponse = await runSecurityPipeline(request, env, config, url, ctx);
             if (securityResponse) return securityResponse;
+
+            // 2. PROTOCOL HANDLERS (after security checks pass)
+            const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase().trim();
+            if (upgradeHeader === "websocket") return await handleWebSocket(request, env);
 
             // 3. EXECUTE FEATURE HANDLER
             const handler = FEATURE_HANDLERS[config.mode] || handleWebTraffic;
             let response = await handler(request, env, config, ctx, url);
 
-            // 4. FINAL FORTIFICATION (Stealth & Security Headers)
-            return fortifyResponse(response, config, env, url);
+            // 5. FINAL FORTIFICATION (Security headers, CORS, fingerprint removal)
+            // Pass request as 5th arg so fortifyResponse can read the Origin header
+            // for CORS — Origin comes from the browser request, not the origin response.
+            return fortifyResponse(response, config, env, url, request);
 
         } catch (err) {
             console.error(`[Shield Error] ${err.message}`);
